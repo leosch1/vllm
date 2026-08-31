@@ -137,6 +137,19 @@ def get_configs_compute_bound():
 
 
 def get_weight_shapes(tp_size):
+    # Qwen/Qwen3.8-27B-FP8, tensor_parallel_size=2 dense W8A8 block-FP8 shapes.
+    # Captured from the live predictor pod's "Using default..." warnings, and
+    # cross-checked against the model's config.json. See
+    # https://github.com/leosch1/vllm-qwen3-8-27b-fp8-l40s-kernel-config-tuning
+    # for the full methodology and results this branch's tuning run backs.
+    return [
+        (17408, 5120),
+        (8192, 5120),
+        (7168, 5120),
+        (5120, 8704),
+        (5120, 3072),
+    ]
+
     # NOTE(HandH1998): The weight shapes only works for DeepSeek-V3.
     # Modify them, if you tune for another different model.
     # cannot TP
