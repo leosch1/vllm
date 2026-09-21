@@ -185,8 +185,45 @@ def get_weight_shapes(tp_size):
     return weight_shapes
 
 
+# Flushing L2 before every timed launch below makes tuning measure the
+# same cold-cache condition real serving has, instead of implicitly
+# reusing the same warm A/B tensors across all 1,280 candidate configs.
+# _flush_buf is lazy so importing this module never touches CUDA.
+_flush_buf = None
+
+
+def resolve_l2_bytes():
+    device = torch.accelerator.current_device_index()
+    try:
+        l2 = torch.cuda.get_device_properties(device).L2_cache_size
+        if l2 and l2 > 0:
+            return l2
+    except AttributeError:
+        pass
+    return (
+        128 * 1024 * 1024
+    )  # fallback if L2_cache_size isn't exposed by this PyTorch build
+
+
+def get_flush_buf():
+    global _flush_buf
+    if _flush_buf is None:
+        _flush_buf = torch.empty(
+            int(resolve_l2_bytes() * 1.5) // 4, dtype=torch.int32, device="cuda"
+        )
+    return _flush_buf
+
+
 def benchmark_config(
-    A, B, As, Bs, block_size, config, out_dtype=torch.float16, num_iters=10
+    A,
+    B,
+    As,
+    Bs,
+    block_size,
+    config,
+    out_dtype=torch.float16,
+    num_iters=10,
+    flush_l2=True,
 ):
     def run():
         w8a8_block_matmul(A, B, As, Bs, block_size, config, out_dtype)
@@ -202,6 +239,8 @@ def benchmark_config(
 
     latencies: list[float] = []
     for i in range(num_iters):
+        if flush_l2:
+            get_flush_buf().zero_()  # evict A/B/C from L2 before launch
         torch.accelerator.synchronize()
         start_event.record()
         run()
@@ -212,7 +251,7 @@ def benchmark_config(
     return avg
 
 
-def tune(M, N, K, block_size, out_dtype, search_space, input_type):
+def tune(M, N, K, block_size, out_dtype, search_space, input_type, flush_l2=True):
     factor_for_scale = 1e-2
 
     if input_type == "fp8":
@@ -254,6 +293,7 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
                 config,
                 out_dtype,
                 num_iters=10,
+                flush_l2=flush_l2,
             )
         except triton.runtime.autotuner.OutOfResources:
             # Some configurations may be invalid and fail to compile.
@@ -326,6 +366,7 @@ def tune_on_gpu(args_dict):
                 out_dtype,
                 search_space,
                 input_type,
+                flush_l2=args.l2_flush,
             )
             for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
         ]
@@ -424,6 +465,16 @@ Then copy to model_executor/layers/quantization/utils/configs
     parser.add_argument("--block-k", type=int, default=128)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--save-path", type=str, default="./")
+    parser.add_argument(
+        "--l2-flush",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Flush the GPU's L2 cache before every timed launch during tuning "
+        "(default: True). Without this, all 1,280 candidate configs per shape "
+        "implicitly reuse the same warm A/B tensors, which biases tuning toward "
+        "configs that only win under an always-warm cache -- a condition real "
+        "serving usually doesn't have.",
+    )
     args = parser.parse_args()
 
     main(args)
